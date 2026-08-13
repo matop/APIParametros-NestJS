@@ -20,9 +20,11 @@ import {
 } from '../constants';
 import type {
   ContextoParametro,
+  OpcionesResultadoParametro,
   ParametroDefinicion,
   ParametroEstructura,
   ParametroValueItem,
+  ResultadoParametro,
 } from '../interfaces';
 
 /**
@@ -50,10 +52,17 @@ export class ParametrosService {
    * ventana de frescura (PARAM_VIGENCIA_MS) y limpiada al refrescar (Inicializa),
    * para que un valor agregado no quede oculto más allá de esa ventana.
    */
-  private readonly memoValores = new Map<string, { valor: string; finMs: number }>();
+  private readonly memoValores = new Map<
+    string,
+    { valor: string; encontrado: boolean; finMs: number }
+  >();
 
   /** Caché en proceso de definiciones (incluye negativos "NoExiste" = null). */
   private readonly memoDefiniciones = new Map<string, ParametroDefinicion | null>();
+
+  /** Disponibilidad observada durante la inicialización del proceso actual. */
+  private readonly estadoValoresPorContexto = new Map<string, 'available' | 'unavailable'>();
+  private readonly estadoDefinicionesPorAplicacion = new Map<string, 'available' | 'unavailable'>();
 
   /**
    * Última notificación de refresco YA consumida por este proceso, por scope
@@ -80,6 +89,26 @@ export class ParametrosService {
    * @returns El valor (string). "" si no existe / no vigente.
    */
   async GetParametro(parametroId: string, contexto: Partial<ContextoParametro>): Promise<string> {
+    const resultado = await this.GetParametroResultado(parametroId, contexto);
+    return resultado.estado === 'configured' || resultado.estado === 'last-known-valid'
+      ? resultado.valor
+      : '';
+  }
+
+  async GetParametroResultado(
+    parametroId: string,
+    contexto: Partial<ContextoParametro>,
+  ): Promise<ResultadoParametro<string>>;
+  async GetParametroResultado<T>(
+    parametroId: string,
+    contexto: Partial<ContextoParametro>,
+    opciones: OpcionesResultadoParametro<T>,
+  ): Promise<ResultadoParametro<T>>;
+  async GetParametroResultado<T = string>(
+    parametroId: string,
+    contexto: Partial<ContextoParametro>,
+    opciones?: OpcionesResultadoParametro<T>,
+  ): Promise<ResultadoParametro<T | string>> {
     const ctx = this.normalizarContexto(contexto);
     const ahora = new Date();
 
@@ -98,12 +127,14 @@ export class ParametrosService {
     }
     if (!def) {
       this.logger.warn(`GetParametro: sin definición para "${parametroId}". ¿Se llamó a Inicializa*?`);
-      return '';
+      return this.estadoDefinicionesPorAplicacion.get(ctx.aplicacionId) === 'available'
+        ? { estado: 'not-configured' }
+        : { estado: 'source-unavailable' };
     }
 
     // 3) Resolver alcance según TipoDefinicionId ("Neg" = negocio, "Disp" = dispositivo).
     const alcance = this.resolverAlcance(def, ctx);
-    if (alcance === null) return '';
+    if (alcance === null) return { estado: 'source-unavailable' };
 
     // 4) La persistencia se indexa por el contexto COMPLETO (App, EmpKey, Alcance),
     //    igual que el KB (getparametro.java líneas 185-192). La jerarquía
@@ -117,14 +148,17 @@ export class ParametrosService {
     const techoMs = nowMs + this.vigenciaMs(); // la caché no vive más que la ventana de frescura
     const memoKey = `${claveContexto}|${base}`;
     let valor: string;
+    let encontrado: boolean;
 
     const cache = this.memoValores.get(memoKey);
     if (cache && cache.finMs > nowMs) {
       valor = cache.valor;
+      encontrado = cache.encontrado;
     } else {
       const items = await this.leerValoresContexto(claveContexto);
       const item = this.seleccionarValorVigente(items, base, ahora);
       valor = item?.ValorParametroValor ?? '';
+      encontrado = item !== null;
       // Hit: hasta el Fin del valor, pero sin exceder la ventana de frescura.
       // Miss (valor vacío): hasta el fin de la ventana de frescura (NO 1 día).
       let finMs = techoMs;
@@ -132,16 +166,38 @@ export class ParametrosService {
         const finReal = this.aEpoch(item?.ValorParametroFin, Infinity);
         finMs = Math.min(Number.isFinite(finReal) ? finReal : techoMs, techoMs);
       }
-      this.memoValores.set(memoKey, { valor, finMs });
+      this.memoValores.set(memoKey, { valor, encontrado, finMs });
     }
 
-    if (!valor) return '';
+    const fuenteNoDisponible =
+      this.estadoValoresPorContexto.get(claveContexto) === 'unavailable';
+    if (!encontrado) {
+      return fuenteNoDisponible || !this.estadoValoresPorContexto.has(claveContexto)
+        ? { estado: 'source-unavailable' }
+        : { estado: 'not-configured' };
+    }
+    if (!valor) return { estado: 'invalid-value' };
 
     // 6) Si hay sufijo, extraer el componente del valor compuesto.
     if (sufijo) {
-      return this.obtenerValorxIndice(valor, sufijo, def);
+      valor = await this.obtenerValorxIndice(valor, sufijo, def);
+      if (!valor) return { estado: 'invalid-value' };
     }
-    return valor;
+
+    let valorDecodificado: T | string = valor;
+    if (opciones) {
+      const decodificado = opciones.decodificar(valor);
+      if (!decodificado.valido) return { estado: 'invalid-value' };
+      valorDecodificado = decodificado.valor;
+    }
+
+    return fuenteNoDisponible
+      ? {
+          estado: 'last-known-valid',
+          valor: valorDecodificado,
+          causa: 'source-unavailable',
+        }
+      : { estado: 'configured', valor: valorDecodificado };
   }
 
   // ===================== Primitiva InicializaParametrosDispositivo =====================
@@ -196,6 +252,7 @@ export class ParametrosService {
       !(await this.persistenciaVigente(scopeCtxId));
 
     if (!debeRefrescar) {
+      this.estadoValoresPorContexto.set(scopeCtxId, 'available');
       return true; // ya vigente, nada que hacer.
     }
 
@@ -206,25 +263,33 @@ export class ParametrosService {
       // Definiciones + estructuras: solo si NO están "throttled" (cambian poco).
       const svcDef = `Definicion_${appId}`;
       if (!(await this.estaOffline(`Throttle_${svcDef}`))) {
+        this.estadoDefinicionesPorAplicacion.set(appId, 'unavailable');
         const okDef = await this.actualizarDefiniciones(appId, modo);
         if (okDef) {
+          this.estadoDefinicionesPorAplicacion.set(appId, 'available');
           await this.actualizarEstructuras(appId);
           await this.registrarOffline(`Throttle_${svcDef}`, this.defThrottleS());
         }
+      } else {
+        // El throttle sólo se registra después de una descarga exitosa.
+        this.estadoDefinicionesPorAplicacion.set(appId, 'available');
       }
 
       // Valores: si el backend está offline (breaker), se mantiene la caché y NO se
       // marca vigente, para reintentar cuando el breaker expire.
+      this.estadoValoresPorContexto.set(scopeCtxId, 'unavailable');
       const okVal = await this.actualizarValores({ appId, empKey, alcanceId, ambienteId, modo });
       if (!okVal) {
         this.logger.warn(`inicializar(${scopeCtxId}): valores no refrescados (offline); se usa caché`);
         return true;
       }
 
+      this.estadoValoresPorContexto.set(scopeCtxId, 'available');
       await this.marcarVigente(scopeCtxId);
       this.invalidarCache(scopeCtxId);
       return true;
     } catch (error) {
+      this.estadoValoresPorContexto.set(scopeCtxId, 'unavailable');
       this.logger.error(`inicializar(${scopeCtxId}): ${(error as Error).message}`);
       return false;
     }

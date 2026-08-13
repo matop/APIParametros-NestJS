@@ -151,10 +151,30 @@ await this.parametros.notificarRefresco('MiApp', 123, dispositivoId);
 | `InicializaParametrosNegocio(appId, empKey, alcanceId, modo)` | al iniciar sesión | Puebla/refresca la persistencia con alcance de negocio provisto. |
 | `InicializaParametrosDispositivo(appId, empKey, modo)` | al iniciar sesión | Puebla/refresca la persistencia con alcance = id del dispositivo. |
 | `GetParametro(parametroId, contexto)` | durante el uso | Lee el valor vigente **desde la persistencia**. Resuelve alcance por `TipoDefinicionId` (`Neg`→negocio, `Disp`→dispositivo). Sufijo compuesto `base_componente` (por nombre) o `base_indice`. |
+| `GetParametroResultado(parametroId, contexto, opciones?)` | durante el uso observable | Distingue `configured`, `last-known-valid`, `not-configured`, `invalid-value` y `source-unavailable`. Un decoder opcional convierte y valida el string sin trasladar reglas de dominio al paquete. |
 | `notificarRefresco(appId, empKey, alcanceId)` | webhook (opcional) | Marca un scope para refresco en el próximo `Inicializa*`. |
 
 `GetParametro` recibe un **contexto explícito** `{ aplicacionId, empKey, alcanceId, ambienteId, modo }`
 (los campos omitidos toman defaults del entorno). No usa estado global mutable.
+
+`GetParametro` se conserva para compatibilidad: devuelve el valor en los estados
+`configured`/`last-known-valid` y `""` en los demás. Los consumidores que deban
+emitir warnings o tomar decisiones de fallback deben usar el resultado discriminado:
+
+```ts
+const resultado = await this.parametros.GetParametroResultado(
+  'MaximoGuias',
+  { aplicacionId: 'MiApp', empKey: 123, alcanceId: 'ALC-01' },
+  {
+    decodificar: (raw) => {
+      const numero = Number(raw);
+      return Number.isInteger(numero) && numero > 0
+        ? { valido: true, valor: numero }
+        : { valido: false };
+    },
+  },
+);
+```
 
 ## Autenticación (header `ApiKey`)
 

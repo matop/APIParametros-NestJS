@@ -56,6 +56,107 @@ describe('GetParametro — resolución de alcance y contexto', () => {
   });
 });
 
+describe('GetParametroResultado — contrato discriminado', () => {
+  test('configured: devuelve un valor vigente y decodificado', async () => {
+    const { svc, fake } = crear();
+    await fake.set(REPO, tagDefinicion('MaximoGuias'), definicion('MaximoGuias'));
+    await fake.set(REPO, contextId(APP, 977, 'ALC'), [valor('MaximoGuias', '40')]);
+
+    const resultado = await svc.GetParametroResultado(
+      'MaximoGuias',
+      { aplicacionId: APP, empKey: 977, alcanceId: 'ALC' },
+      {
+        decodificar: (raw) => {
+          const numero = Number(raw);
+          return Number.isInteger(numero) && numero > 0
+            ? { valido: true as const, valor: numero }
+            : { valido: false as const };
+        },
+      },
+    );
+
+    expect(resultado).toEqual({ estado: 'configured', valor: 40 });
+  });
+
+  test('not-configured: la fuente respondió y no configuró el parámetro', async () => {
+    const consumo = fakeConsumo({
+      definiciones: [definicion('MaximoGuias')],
+      valores: [],
+    });
+    const { svc } = crear({ consumo });
+
+    expect(await svc.InicializaParametrosNegocio(APP, 977, 'ALC', 'WebApp')).toBe(true);
+    expect(
+      await svc.GetParametroResultado('MaximoGuias', {
+        aplicacionId: APP,
+        empKey: 977,
+        alcanceId: 'ALC',
+      }),
+    ).toEqual({ estado: 'not-configured' });
+  });
+
+  test('invalid-value: el decoder rechaza el valor sin exponerlo', async () => {
+    const { svc, fake } = crear();
+    await fake.set(REPO, tagDefinicion('MaximoGuias'), definicion('MaximoGuias'));
+    await fake.set(REPO, contextId(APP, 977, 'ALC'), [valor('MaximoGuias', 'abc')]);
+
+    const resultado = await svc.GetParametroResultado(
+      'MaximoGuias',
+      { aplicacionId: APP, empKey: 977, alcanceId: 'ALC' },
+      { decodificar: () => ({ valido: false }) },
+    );
+
+    expect(resultado).toEqual({ estado: 'invalid-value' });
+  });
+
+  test('last-known-valid: conserva el valor validado cuando el refresco queda offline', async () => {
+    const consumo = fakeConsumo({
+      definiciones: [definicion('MaximoGuias')],
+      valores: [valor('MaximoGuias', '55')],
+    });
+    const { svc } = crear({ consumo });
+    const ctx = { aplicacionId: APP, empKey: 977, alcanceId: 'ALC' };
+
+    expect(await svc.InicializaParametrosNegocio(APP, 977, 'ALC', 'WebApp')).toBe(true);
+    consumo.getParametrosValues.mockRejectedValueOnce(
+      Object.assign(new Error('conn refused'), { request: {}, code: 'ECONNREFUSED' }),
+    );
+    expect(await svc.InicializaParametrosNegocio(APP, 977, 'ALC', 'WebApp')).toBe(false);
+
+    expect(await svc.GetParametroResultado('MaximoGuias', ctx)).toEqual({
+      estado: 'last-known-valid',
+      valor: '55',
+      causa: 'source-unavailable',
+    });
+  });
+
+  test('source-unavailable: no inventa ausencia cuando falla la fuente sin caché', async () => {
+    const consumo = fakeConsumo({ definiciones: [definicion('MaximoGuias')] });
+    consumo.getParametrosValues.mockRejectedValueOnce(
+      Object.assign(new Error('conn refused'), { request: {}, code: 'ECONNREFUSED' }),
+    );
+    const { svc } = crear({ consumo });
+
+    expect(await svc.InicializaParametrosNegocio(APP, 977, 'ALC', 'WebApp')).toBe(false);
+    expect(
+      await svc.GetParametroResultado('MaximoGuias', {
+        aplicacionId: APP,
+        empKey: 977,
+        alcanceId: 'ALC',
+      }),
+    ).toEqual({ estado: 'source-unavailable' });
+  });
+
+  test('GetParametro conserva la compatibilidad string/""', async () => {
+    const { svc, fake } = crear();
+    await fake.set(REPO, tagDefinicion('P'), definicion('P'));
+    await fake.set(REPO, contextId(APP, 1, 'A'), [valor('P', '42')]);
+
+    expect(await svc.GetParametro('P', { aplicacionId: APP, empKey: 1, alcanceId: 'A' })).toBe('42');
+    expect(await svc.GetParametro('NoExiste', { aplicacionId: APP, empKey: 1, alcanceId: 'A' })).toBe('');
+  });
+});
+
 describe('GetParametro — ventana de vigencia', () => {
   test('valor con Fin en el pasado no es vigente → ""', async () => {
     const { svc, fake } = crear();
